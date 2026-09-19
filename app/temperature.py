@@ -11,8 +11,9 @@
    视为数据空洞、不计入任何时长；最后一个样本不形成区间；
 4. 起始样本温度高于 ``max_temperature`` 的区间为高温越界（high），低于
    ``min_temperature`` 的为低温越界（low），恰好等于阈值视为在范围内；
-   将每段越界区间与保管人区间求交，跨保管人区间边界（交接点）必须拆分为
-   多段，未被任何保管人区间覆盖的部分计入未归属；
+   用公共层 :func:`app.timeline.split_interval` 把每段越界区间与保管人
+   覆盖区间求交，跨保管人区间边界（交接点）必须拆分为多段，未被任何
+   保管人区间覆盖的部分计入未归属；
 5. 按保管人汇总高温 / 低温秒数与各自最大偏差，返回逐段明细（含起始样本
    下标）、全局最大偏差与未归属总秒数。
 
@@ -22,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from .models import (
     CustodianTemperatureSummary,
@@ -35,21 +36,17 @@ from .models import (
     TemperatureMaxDeviation,
     TemperatureSample,
 )
+from .timeline import (
+    CoverInterval,
+    ensure_comparable,
+    split_interval,
+    valid_events,
+)
 from .validator import validate_events
 
 
 class TemperatureAuditError(ValueError):
     """审计入参的语义错误（在路由层转换为 HTTP 422）。"""
-
-
-@dataclass(frozen=True)
-class _CustodianInterval:
-    """一段保管人半开区间 [start, end)；end 为 None 表示向右开放。"""
-
-    start: datetime
-    end: Optional[datetime]
-    custodian: str
-    event_index: int
 
 
 @dataclass(frozen=True)
@@ -64,32 +61,47 @@ class _BreachInterval:
     sample_index: int
 
 
-def _derive_custodian_intervals(
+@dataclass(frozen=True)
+class _CustodianInfo:
+    """保管人覆盖区间的领域归属：保管人及开启区间的有效事件全链下标。"""
+
+    custodian: str
+    event_index: int
+
+
+def _derive_custodian_covers(
     events: List[Event], event_results: List[EventResult]
-) -> List[_CustodianInterval]:
-    """从 status=ok 的 seal/reseal/handover 事件生成保管人半开区间。
+) -> List[CoverInterval[_CustodianInfo]]:
+    """从 status=ok 的 seal/reseal/handover 事件生成保管人覆盖区间。
 
-    每个有效事件开启对应保管人的区间，下一个有效事件闭合前一区间；
-    有效事件时间戳严格递增（状态机规则 5），区间必然良构；
-    最后一个区间向右开放。
+    事件过滤与全链下标保留由公共层 :func:`app.timeline.valid_events` 完成；
+    每个有效事件开启对应保管人的半开覆盖区间，下一个有效事件闭合前一区间
+    （有效事件时间戳严格递增，区间必然按起点有序且首尾相接），最后一个
+    区间以 ``end=None`` 向右开放。unseal 与违规事件不产生区间。
     """
-    points: List[Tuple[datetime, str, int]] = []
-    for event, result in zip(events, event_results):
-        if result.status != "ok":
-            continue
-        if event.type not in (EventType.SEAL, EventType.RESEAL, EventType.HANDOVER):
-            continue
-        points.append((event.timestamp, event.custodian, result.index))  # type: ignore[arg-type]
+    points = [
+        (selected.event.timestamp, selected.event.custodian, selected.index)
+        for selected in valid_events(
+            events,
+            event_results,
+            types=(EventType.SEAL, EventType.RESEAL, EventType.HANDOVER),
+        )
+    ]
 
-    intervals: List[_CustodianInterval] = []
+    covers: List[CoverInterval[_CustodianInfo]] = []
     for i, (start, custodian, event_index) in enumerate(points):
         end = points[i + 1][0] if i + 1 < len(points) else None
-        intervals.append(
-            _CustodianInterval(
-                start=start, end=end, custodian=custodian, event_index=event_index
+        covers.append(
+            CoverInterval(
+                start=start,
+                end=end,
+                payload=_CustodianInfo(
+                    custodian=custodian,  # type: ignore[arg-type]
+                    event_index=event_index,
+                ),
             )
         )
-    return intervals
+    return covers
 
 
 def _derive_breach_intervals(
@@ -126,61 +138,31 @@ def _derive_breach_intervals(
 
 
 def _split_by_custodian(
-    breach: _BreachInterval, intervals: List[_CustodianInterval]
+    breach: _BreachInterval, covers: List[CoverInterval[_CustodianInfo]]
 ) -> List[TemperatureBreachSegment]:
-    """把一段越界区间按保管人区间边界拆分（跨交接点必须拆分）。
+    """把一段越界区间按保管人覆盖区间边界拆分（跨交接点必须拆分）。
 
-    保管人区间按时间升序且首尾相接；未被任何区间覆盖的部分为未归属段。
+    切分由公共层 :func:`app.timeline.split_interval` 统一完成（覆盖区间
+    首尾相接、最后一个向右开放）；这里把通用 covered/gap 片段映射为温控
+    明细：covered 归属命中保管人，gap 为未归属段。
     """
-    pieces: List[Tuple[datetime, datetime, Optional[_CustodianInterval]]] = []
-    cursor = breach.start
-    for interval in intervals:
-        if cursor >= breach.end:
-            break
-        if interval.end is not None and interval.end <= cursor:
-            continue  # 保管人区间整体在游标之前
-        if interval.start >= breach.end:
-            break  # 保管人区间整体在越界区间之后
-        if interval.start > cursor:
-            # 保管人区间开始前的部分未归属
-            pieces.append((cursor, interval.start, None))
-            cursor = interval.start
-        overlap_end = breach.end if interval.end is None else min(breach.end, interval.end)
-        if overlap_end > cursor:
-            pieces.append((cursor, overlap_end, interval))
-            cursor = overlap_end
-    if cursor < breach.end:
-        pieces.append((cursor, breach.end, None))
-
+    pieces = split_interval(breach.start, breach.end, covers)
     return [
         TemperatureBreachSegment(
-            start=piece_start,
-            end=piece_end,
-            seconds=(piece_end - piece_start).total_seconds(),
+            start=piece.start,
+            end=piece.end,
+            seconds=(piece.end - piece.start).total_seconds(),
             kind=breach.kind,
             temperature=breach.temperature,
             deviation=breach.deviation,
             sample_index=breach.sample_index,
-            custodian=interval.custodian if interval is not None else None,
-            custodian_event_index=interval.event_index if interval is not None else None,
+            custodian=piece.payload.custodian if piece.payload is not None else None,
+            custodian_event_index=(
+                piece.payload.event_index if piece.payload is not None else None
+            ),
         )
-        for piece_start, piece_end, interval in pieces
+        for piece in pieces
     ]
-
-
-def _ensure_comparable(events: List[Event], samples: List[TemperatureSample]) -> None:
-    """混用带时区与不带时区的时间无法比较，统一报 422。"""
-    timestamps = [event.timestamp for event in events]
-    timestamps.extend(sample.timestamp for sample in samples)
-    if not timestamps:
-        return
-    aware = timestamps[0].tzinfo is not None and timestamps[0].utcoffset() is not None
-    for value in timestamps[1:]:
-        value_aware = value.tzinfo is not None and value.utcoffset() is not None
-        if value_aware != aware:
-            raise TemperatureAuditError(
-                "时间戳时区信息不一致（不能混用带时区与不带时区的时间）"
-            )
 
 
 def _ensure_strictly_increasing(samples: List[TemperatureSample]) -> None:
@@ -197,10 +179,12 @@ def _ensure_strictly_increasing(samples: List[TemperatureSample]) -> None:
 def audit_temperature(request: TemperatureAuditRequest) -> TemperatureAuditResponse:
     """校验事件链并把越界温度时长归属到保管人。"""
     validation = validate_events(request.events)
-    _ensure_comparable(request.events, request.samples)
+    timestamps = [event.timestamp for event in request.events]
+    timestamps.extend(sample.timestamp for sample in request.samples)
+    ensure_comparable(timestamps, TemperatureAuditError)
     _ensure_strictly_increasing(request.samples)
 
-    custodian_intervals = _derive_custodian_intervals(request.events, validation.events)
+    custodian_covers = _derive_custodian_covers(request.events, validation.events)
     breaches = _derive_breach_intervals(
         request.samples,
         request.min_temperature,
@@ -210,7 +194,7 @@ def audit_temperature(request: TemperatureAuditRequest) -> TemperatureAuditRespo
 
     segments: List[TemperatureBreachSegment] = []
     for breach in breaches:  # 越界区间按样本顺序产生，本身即时间升序
-        segments.extend(_split_by_custodian(breach, custodian_intervals))
+        segments.extend(_split_by_custodian(breach, custodian_covers))
 
     # 按保管人汇总（按首次归属时间升序，仅包含有越界时长的保管人）
     summaries: Dict[str, CustodianTemperatureSummary] = {}

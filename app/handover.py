@@ -4,7 +4,8 @@
 1. 调用现有单链校验器（``validate_events``）得到原校验结果并原样保留；
 2. 仅从校验结果中 ``status=ok`` 的 seal / reseal / handover 事件提取实际到任
    记录（保管人即事件发生后的在任保管人），并保留其在**全链事件**中的下标；
-   unseal 及违规事件一律不是到任记录；
+   事件过滤由公共层 :func:`app.timeline.valid_events` 完成，unseal 及违规
+   事件一律不是到任记录；
 3. 按“保管人相同且顺序不交叉”做计划节点与实际记录间的一对一匹配，采用
    序列对齐式动态规划求**全局最优**（绝非逐项贪心），目标依次为：
      a. 最大化匹配数；
@@ -33,6 +34,7 @@ from .models import (
     HandoverPlanSummary,
     UnexpectedArrival,
 )
+from .timeline import ensure_comparable, valid_events
 from .validator import validate_events
 
 
@@ -61,22 +63,24 @@ _DP_ZERO: _DpKey = (0, 0.0, ())
 def _extract_arrivals(
     events: Sequence[Event], event_results: Sequence[EventResult]
 ) -> List[_Arrival]:
-    """从 status=ok 的 seal/reseal/handover 事件提取实际到任记录。"""
-    arrivals: List[_Arrival] = []
-    for event, result in zip(events, event_results):
-        if result.status != "ok":
-            continue
-        if event.type not in (EventType.SEAL, EventType.RESEAL, EventType.HANDOVER):
-            continue
-        arrivals.append(
-            _Arrival(
-                event_index=result.index,
-                timestamp=event.timestamp,
-                custodian=event.custodian,  # type: ignore[arg-type]
-                type=event.type,
-            )
+    """从 status=ok 的 seal/reseal/handover 事件提取实际到任记录。
+
+    事件过滤与全链下标保留由公共层 :func:`app.timeline.valid_events` 完成，
+    这里仅把领域无关记录映射为到任字段（保管人 / 来源类型）。
+    """
+    return [
+        _Arrival(
+            event_index=selected.index,
+            timestamp=selected.event.timestamp,
+            custodian=selected.event.custodian,  # type: ignore[arg-type]
+            type=selected.event.type,
         )
-    return arrivals
+        for selected in valid_events(
+            events,
+            event_results,
+            types=(EventType.SEAL, EventType.RESEAL, EventType.HANDOVER),
+        )
+    ]
 
 
 def _timing(timestamp: datetime, node: HandoverPlanNode) -> Tuple[str, float]:
@@ -86,25 +90,6 @@ def _timing(timestamp: datetime, node: HandoverPlanNode) -> Tuple[str, float]:
     if timestamp >= node.window_end:
         return "late", (timestamp - node.window_end).total_seconds()
     return "on_time", 0.0
-
-
-def _ensure_comparable(
-    events: Sequence[Event], nodes: Sequence[HandoverPlanNode]
-) -> None:
-    """混用带时区与不带时区的时间无法比较，统一报 422。"""
-    timestamps: List[datetime] = [event.timestamp for event in events]
-    for node in nodes:
-        timestamps.append(node.window_start)
-        timestamps.append(node.window_end)
-    if not timestamps:
-        return
-    aware = timestamps[0].tzinfo is not None and timestamps[0].utcoffset() is not None
-    for value in timestamps[1:]:
-        value_aware = value.tzinfo is not None and value.utcoffset() is not None
-        if value_aware != aware:
-            raise HandoverPlanAuditError(
-                "时间戳时区信息不一致（不能混用带时区与不带时区的时间）"
-            )
 
 
 def _optimal_matching(
@@ -195,7 +180,11 @@ def _optimal_matching(
 def audit_handover_plan(request: HandoverPlanAuditRequest) -> HandoverPlanAuditResponse:
     """校验事件链并求实际到任记录与计划节点的全局最优匹配。"""
     validation = validate_events(request.events)
-    _ensure_comparable(request.events, request.plan)
+    timestamps = [event.timestamp for event in request.events]
+    for node in request.plan:
+        timestamps.append(node.window_start)
+        timestamps.append(node.window_end)
+    ensure_comparable(timestamps, HandoverPlanAuditError)
 
     arrivals = _extract_arrivals(request.events, validation.events)
     pairs = _optimal_matching(request.plan, arrivals)
