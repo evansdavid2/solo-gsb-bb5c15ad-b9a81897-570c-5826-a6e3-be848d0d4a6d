@@ -33,11 +33,16 @@ from .models import (
     HandoverPlanSummary,
     UnexpectedArrival,
 )
+from .timeline import ensure_comparable, ok_event_records
 from .validator import validate_events
 
 
 class HandoverPlanAuditError(ValueError):
     """审计入参的语义错误（在路由层转换为 HTTP 422）。"""
+
+
+# 到任记录的事件类型：seal / reseal / handover（unseal 不是到任记录）
+_ARRIVAL_TYPES = (EventType.SEAL, EventType.RESEAL, EventType.HANDOVER)
 
 
 @dataclass(frozen=True)
@@ -62,21 +67,15 @@ def _extract_arrivals(
     events: Sequence[Event], event_results: Sequence[EventResult]
 ) -> List[_Arrival]:
     """从 status=ok 的 seal/reseal/handover 事件提取实际到任记录。"""
-    arrivals: List[_Arrival] = []
-    for event, result in zip(events, event_results):
-        if result.status != "ok":
-            continue
-        if event.type not in (EventType.SEAL, EventType.RESEAL, EventType.HANDOVER):
-            continue
-        arrivals.append(
-            _Arrival(
-                event_index=result.index,
-                timestamp=event.timestamp,
-                custodian=event.custodian,  # type: ignore[arg-type]
-                type=event.type,
-            )
+    return [
+        _Arrival(
+            event_index=record.index,
+            timestamp=record.timestamp,
+            custodian=record.custodian,  # type: ignore[arg-type]
+            type=record.type,
         )
-    return arrivals
+        for record in ok_event_records(events, event_results, _ARRIVAL_TYPES)
+    ]
 
 
 def _timing(timestamp: datetime, node: HandoverPlanNode) -> Tuple[str, float]:
@@ -86,25 +85,6 @@ def _timing(timestamp: datetime, node: HandoverPlanNode) -> Tuple[str, float]:
     if timestamp >= node.window_end:
         return "late", (timestamp - node.window_end).total_seconds()
     return "on_time", 0.0
-
-
-def _ensure_comparable(
-    events: Sequence[Event], nodes: Sequence[HandoverPlanNode]
-) -> None:
-    """混用带时区与不带时区的时间无法比较，统一报 422。"""
-    timestamps: List[datetime] = [event.timestamp for event in events]
-    for node in nodes:
-        timestamps.append(node.window_start)
-        timestamps.append(node.window_end)
-    if not timestamps:
-        return
-    aware = timestamps[0].tzinfo is not None and timestamps[0].utcoffset() is not None
-    for value in timestamps[1:]:
-        value_aware = value.tzinfo is not None and value.utcoffset() is not None
-        if value_aware != aware:
-            raise HandoverPlanAuditError(
-                "时间戳时区信息不一致（不能混用带时区与不带时区的时间）"
-            )
 
 
 def _optimal_matching(
@@ -195,7 +175,12 @@ def _optimal_matching(
 def audit_handover_plan(request: HandoverPlanAuditRequest) -> HandoverPlanAuditResponse:
     """校验事件链并求实际到任记录与计划节点的全局最优匹配。"""
     validation = validate_events(request.events)
-    _ensure_comparable(request.events, request.plan)
+
+    timestamps: List[datetime] = [event.timestamp for event in request.events]
+    for node in request.plan:
+        timestamps.append(node.window_start)
+        timestamps.append(node.window_end)
+    ensure_comparable(timestamps, HandoverPlanAuditError)
 
     arrivals = _extract_arrivals(request.events, validation.events)
     pairs = _optimal_matching(request.plan, arrivals)

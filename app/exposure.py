@@ -8,9 +8,9 @@
    （``end == start`` 的退化区间不产生任何分段、不计时长）；
 3. 对授权窗口（``allowed_windows``）按起点排序后合并相交或首尾相接
    （``end == next.start``）的窗口，嵌套窗口随合并自然消解，乱序输入不影响结果；
-4. 对每段开封区间与合并后的授权窗口做区间差：落在窗口内的部分计入
-   ``covered``，其余计入 ``uncovered``，并给出未授权总秒数以及每段对应的
-   有效开封 / 重封事件下标。
+4. 对每段开封区间与合并后的授权窗口做区间差（复用 ``timeline.split_by_cover``
+   半开区间分割器）：落在窗口内的部分计入 ``covered``，其余计入
+   ``uncovered``，并给出未授权总秒数以及每段对应的有效开封 / 重封事件下标。
 
 所有输出分段按时间升序排列；一段开封跨多个授权窗口时，被窗口切出的各
 covered / uncovered 分段同样保持时间升序，结果与窗口输入顺序无关。
@@ -30,11 +30,21 @@ from .models import (
     ExposureAuditResponse,
     ExposureSegment,
 )
+from .timeline import (
+    CoverInterval,
+    ensure_comparable,
+    ok_event_records,
+    split_by_cover,
+)
 from .validator import validate_events
 
 
 class ExposureAuditError(ValueError):
     """审计入参的语义错误（在路由层转换为 HTTP 422）。"""
+
+
+# 推导开封区间的事件类型：有效 unseal 开启一段，有效 reseal 闭合该段
+_OPEN_INTERVAL_TYPES = (EventType.UNSEAL, EventType.RESEAL)
 
 
 @dataclass(frozen=True)
@@ -59,20 +69,18 @@ def _derive_open_intervals(
     open_start: Optional[datetime] = None
     open_index: Optional[int] = None
 
-    for event, result in zip(events, event_results):
-        if result.status != "ok":
-            continue
-        if event.type is EventType.UNSEAL:
+    for record in ok_event_records(events, event_results, _OPEN_INTERVAL_TYPES):
+        if record.type is EventType.UNSEAL:
             if open_start is None:  # 状态机保证 unseal 前必然已封装
-                open_start = event.timestamp
-                open_index = result.index
-        elif event.type is EventType.RESEAL and open_start is not None:
+                open_start = record.timestamp
+                open_index = record.index
+        elif record.type is EventType.RESEAL and open_start is not None:
             intervals.append(
                 _OpenInterval(
                     start=open_start,
-                    end=event.timestamp,
+                    end=record.timestamp,
                     unseal_index=open_index,  # type: ignore[arg-type]
-                    reseal_index=result.index,
+                    reseal_index=record.index,
                 )
             )
             open_start = None
@@ -119,42 +127,18 @@ def _subtract(
     interval: _OpenInterval, merged_windows: List[Tuple[datetime, datetime]]
 ) -> Tuple[List[ExposureSegment], List[ExposureSegment]]:
     """对一段开封区间做区间差，返回 (covered, uncovered)，各自按时间升序。"""
+    covers = [
+        CoverInterval(start=win_start, end=win_end)
+        for win_start, win_end in merged_windows
+    ]
     covered: List[ExposureSegment] = []
     uncovered: List[ExposureSegment] = []
-    cursor = interval.start
-
-    for win_start, win_end in merged_windows:
-        if win_end <= cursor or win_start >= interval.end:
-            continue  # 窗口在游标之前或完全落在区间之后
-        overlap_start = max(cursor, win_start)
-        overlap_end = min(interval.end, win_end)
-        if overlap_start >= overlap_end:
-            continue
-
-        if overlap_start > cursor:
-            uncovered.append(_segment(cursor, overlap_start, interval))
-        covered.append(_segment(overlap_start, overlap_end, interval))
-        cursor = overlap_end
-        if cursor >= interval.end:
-            break
-
-    if cursor < interval.end:
-        uncovered.append(_segment(cursor, interval.end, interval))
-
+    for piece in split_by_cover(interval.start, interval.end, covers):
+        if piece.covered:
+            covered.append(_segment(piece.start, piece.end, interval))
+        else:
+            uncovered.append(_segment(piece.start, piece.end, interval))
     return covered, uncovered
-
-
-def _ensure_comparable(values: List[datetime]) -> None:
-    """混用带时区与不带时区的时间无法比较，统一报 422。"""
-    if not values:
-        return
-    aware = values[0].tzinfo is not None and values[0].utcoffset() is not None
-    for value in values[1:]:
-        value_aware = value.tzinfo is not None and value.utcoffset() is not None
-        if value_aware != aware:
-            raise ExposureAuditError(
-                "时间戳时区信息不一致（不能混用带时区与不带时区的时间）"
-            )
 
 
 def audit_exposure(request: ExposureAuditRequest) -> ExposureAuditResponse:
@@ -172,7 +156,7 @@ def audit_exposure(request: ExposureAuditRequest) -> ExposureAuditResponse:
         timestamps.append(last_valid)
     timestamps.extend(w.start for w in request.allowed_windows)
     timestamps.extend(w.end for w in request.allowed_windows)
-    _ensure_comparable(timestamps)
+    ensure_comparable(timestamps, ExposureAuditError)
 
     if last_valid is not None and request.audit_until < last_valid:
         raise ExposureAuditError(

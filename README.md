@@ -827,11 +827,12 @@ app/
   main.py        # FastAPI 入口与路由
   models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计、分段校验与库存分配规划）
   validator.py   # 单链状态机校验核心
+  timeline.py    # 时间线公共层（status=ok 事件过滤并保留全链下标 / 半开区间 covered-gap 分割 / 时区可比性检查）
   batch.py       # 批量封签占用检查（跨链冲突）
   reconcile.py   # 离线片段合并重建（去重 / 结构诊断 / 调用单链校验）
-  exposure.py    # 开封暴露审计（开封区间推导 / 窗口合并 / 区间差）
-  handover.py    # 交接计划符合性审计（实际到任提取 / 全局最优匹配动态规划）
-  temperature.py # 温控责任审计（保管人区间 / 前值保持越界区间 / 求交拆分与汇总）
+  exposure.py    # 开封暴露审计（开封区间推导 / 窗口合并 / 区间差，复用 timeline 公共层）
+  handover.py    # 交接计划符合性审计（实际到任提取 / 全局最优匹配动态规划，复用 timeline 公共层）
+  temperature.py # 温控责任审计（保管人区间 / 前值保持越界区间 / 求交拆分与汇总，复用 timeline 公共层）
   chunk.py       # 分段校验（续传令牌签发 / 验签 / 状态还原）
   allocation.py  # 封签库存分配规划（占用排除 / 候选边 / 全局最优分配动态规划）
 tests/
@@ -841,6 +842,7 @@ tests/
   test_exposure.py
   test_handover.py
   test_temperature.py
+  test_timeline.py
   test_chunk.py
   test_allocation.py
 Dockerfile

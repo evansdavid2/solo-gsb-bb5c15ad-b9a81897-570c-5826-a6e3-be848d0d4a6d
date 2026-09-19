@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from .models import (
     CustodianTemperatureSummary,
@@ -35,11 +35,21 @@ from .models import (
     TemperatureMaxDeviation,
     TemperatureSample,
 )
+from .timeline import (
+    CoverInterval,
+    ensure_comparable,
+    ok_event_records,
+    split_by_cover,
+)
 from .validator import validate_events
 
 
 class TemperatureAuditError(ValueError):
     """审计入参的语义错误（在路由层转换为 HTTP 422）。"""
+
+
+# 生成保管人区间的事件类型：seal / reseal / handover（unseal 不改变保管人）
+_CUSTODIAN_TYPES = (EventType.SEAL, EventType.RESEAL, EventType.HANDOVER)
 
 
 @dataclass(frozen=True)
@@ -73,20 +83,16 @@ def _derive_custodian_intervals(
     有效事件时间戳严格递增（状态机规则 5），区间必然良构；
     最后一个区间向右开放。
     """
-    points: List[Tuple[datetime, str, int]] = []
-    for event, result in zip(events, event_results):
-        if result.status != "ok":
-            continue
-        if event.type not in (EventType.SEAL, EventType.RESEAL, EventType.HANDOVER):
-            continue
-        points.append((event.timestamp, event.custodian, result.index))  # type: ignore[arg-type]
-
+    records = ok_event_records(events, event_results, _CUSTODIAN_TYPES)
     intervals: List[_CustodianInterval] = []
-    for i, (start, custodian, event_index) in enumerate(points):
-        end = points[i + 1][0] if i + 1 < len(points) else None
+    for i, record in enumerate(records):
+        end = records[i + 1].timestamp if i + 1 < len(records) else None
         intervals.append(
             _CustodianInterval(
-                start=start, end=end, custodian=custodian, event_index=event_index
+                start=record.timestamp,
+                end=end,
+                custodian=record.custodian,  # type: ignore[arg-type]
+                event_index=record.index,
             )
         )
     return intervals
@@ -132,55 +138,26 @@ def _split_by_custodian(
 
     保管人区间按时间升序且首尾相接；未被任何区间覆盖的部分为未归属段。
     """
-    pieces: List[Tuple[datetime, datetime, Optional[_CustodianInterval]]] = []
-    cursor = breach.start
-    for interval in intervals:
-        if cursor >= breach.end:
-            break
-        if interval.end is not None and interval.end <= cursor:
-            continue  # 保管人区间整体在游标之前
-        if interval.start >= breach.end:
-            break  # 保管人区间整体在越界区间之后
-        if interval.start > cursor:
-            # 保管人区间开始前的部分未归属
-            pieces.append((cursor, interval.start, None))
-            cursor = interval.start
-        overlap_end = breach.end if interval.end is None else min(breach.end, interval.end)
-        if overlap_end > cursor:
-            pieces.append((cursor, overlap_end, interval))
-            cursor = overlap_end
-    if cursor < breach.end:
-        pieces.append((cursor, breach.end, None))
-
+    covers = [
+        CoverInterval(start=interval.start, end=interval.end, payload=interval)
+        for interval in intervals
+    ]
     return [
         TemperatureBreachSegment(
-            start=piece_start,
-            end=piece_end,
-            seconds=(piece_end - piece_start).total_seconds(),
+            start=piece.start,
+            end=piece.end,
+            seconds=piece.seconds,
             kind=breach.kind,
             temperature=breach.temperature,
             deviation=breach.deviation,
             sample_index=breach.sample_index,
-            custodian=interval.custodian if interval is not None else None,
-            custodian_event_index=interval.event_index if interval is not None else None,
+            custodian=piece.payload.custodian if piece.payload is not None else None,
+            custodian_event_index=(
+                piece.payload.event_index if piece.payload is not None else None
+            ),
         )
-        for piece_start, piece_end, interval in pieces
+        for piece in split_by_cover(breach.start, breach.end, covers)
     ]
-
-
-def _ensure_comparable(events: List[Event], samples: List[TemperatureSample]) -> None:
-    """混用带时区与不带时区的时间无法比较，统一报 422。"""
-    timestamps = [event.timestamp for event in events]
-    timestamps.extend(sample.timestamp for sample in samples)
-    if not timestamps:
-        return
-    aware = timestamps[0].tzinfo is not None and timestamps[0].utcoffset() is not None
-    for value in timestamps[1:]:
-        value_aware = value.tzinfo is not None and value.utcoffset() is not None
-        if value_aware != aware:
-            raise TemperatureAuditError(
-                "时间戳时区信息不一致（不能混用带时区与不带时区的时间）"
-            )
 
 
 def _ensure_strictly_increasing(samples: List[TemperatureSample]) -> None:
@@ -197,7 +174,10 @@ def _ensure_strictly_increasing(samples: List[TemperatureSample]) -> None:
 def audit_temperature(request: TemperatureAuditRequest) -> TemperatureAuditResponse:
     """校验事件链并把越界温度时长归属到保管人。"""
     validation = validate_events(request.events)
-    _ensure_comparable(request.events, request.samples)
+
+    timestamps = [event.timestamp for event in request.events]
+    timestamps.extend(sample.timestamp for sample in request.samples)
+    ensure_comparable(timestamps, TemperatureAuditError)
     _ensure_strictly_increasing(request.samples)
 
     custodian_intervals = _derive_custodian_intervals(request.events, validation.events)
